@@ -1,21 +1,9 @@
 #!/usr/bin/env deno --allow-all
 
-const {
-  args,
-  env,
-  readDirSync,
-  mkdirSync,
-  writeFile,
-  exit,
-  stdin,
-  stat,
-  readAll,
-  run,
-  remove
-} = Deno;
+const { args, env, exit, stdin, stat, readAll, remove, chmod } = Deno;
 import * as path from "../fs/path.ts";
+import * as fs from "../fs/mod.ts";
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8");
 
 enum Permission {
@@ -78,14 +66,6 @@ async function yesNoPrompt(message: string): Promise<boolean> {
   return input === "y" || input === "Y";
 }
 
-function createDirIfNotExists(path: string): void {
-  try {
-    readDirSync(path);
-  } catch (e) {
-    mkdirSync(path, true);
-  }
-}
-
 function checkIfExistsInPath(path: string): boolean {
   const { PATH } = env();
 
@@ -124,8 +104,7 @@ async function fetchWithRedirects(
   return response;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function fetchModule(url: string): Promise<any> {
+async function fetchModule(url: string): Promise<string> {
   const response = await fetchWithRedirects(url);
 
   if (response.status !== 200) {
@@ -140,12 +119,12 @@ async function fetchModule(url: string): Promise<any> {
 function showHelp(): void {
   console.log(`deno installer
   Install remote or local script as executables.
-  
+
 USAGE:
-  deno https://deno.land/std/installer/mod.ts EXE_NAME SCRIPT_URL [FLAGS...]  
+  deno https://deno.land/std/installer/mod.ts EXE_NAME SCRIPT_URL [FLAGS...]
 
 ARGS:
-  EXE_NAME  Name for executable     
+  EXE_NAME  Name for executable
   SCRIPT_URL  Local or remote URL of script to install
   [FLAGS...]  List of flags for script, both Deno permission and script specific flag can be used.
   `);
@@ -157,18 +136,11 @@ export async function install(
   flags: string[]
 ): Promise<void> {
   const installerDir = getInstallerDir();
-  createDirIfNotExists(installerDir);
+  await fs.ensureDir(installerDir);
 
   const filePath = path.join(installerDir, moduleName);
 
-  let fileInfo;
-  try {
-    fileInfo = await stat(filePath);
-  } catch (e) {
-    // pass
-  }
-
-  if (fileInfo) {
+  if (await fs.exists(filePath)) {
     const msg = `⚠️  ${moduleName} is already installed, do you want to overwrite it?`;
     if (!(await yesNoPrompt(msg))) {
       return;
@@ -203,26 +175,34 @@ export async function install(
     "deno",
     ...grantedPermissions.map(getFlagFromPermission),
     moduleUrl,
-    ...scriptArgs,
-    "$@"
+    ...scriptArgs
   ];
 
-  // TODO: add windows Version
-  const template = `#/bin/sh\n${commands.join(" ")}`;
-  await writeFile(filePath, encoder.encode(template));
+  const template = `#!/usr/bin/env deno run --allow-run
 
-  const makeExecutable = run({ args: ["chmod", "+x", filePath] });
-  const { code } = await makeExecutable.status();
-  makeExecutable.close();
+(async () => {
+  const args = ${JSON.stringify(commands)}.concat(Deno.args.slice(1));
+  const ps = Deno.run({
+    stdout: "inherit",
+    stderr: "inherit",
+    stdin: "inherit",
+    args: Deno.build.os === "win" ? ["cmd.exe", "/c", ...args] : args
+  });
 
-  if (code !== 0) {
-    throw new Error("Failed to make file executable");
-  }
+  const status = await ps.status();
+
+  ps.close();
+  Deno.exit(status.code);
+})();
+`;
+  await fs.writeFileStr(filePath, template);
+
+  // make file executable
+  await chmod(filePath, 0o755);
 
   console.log(`✅ Successfully installed ${moduleName}`);
   console.log(filePath);
 
-  // TODO: add Windows version
   if (!checkIfExistsInPath(installerDir)) {
     console.log("\nℹ️  Add ~/.deno/bin to PATH");
     console.log(
